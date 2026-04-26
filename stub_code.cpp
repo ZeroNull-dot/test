@@ -90,9 +90,8 @@ static FARPROC GetProc(HMODULE hMod, const char* name) {
 static BOOL IsVM() {
     int cpu[4] = {0};
     __cpuid(cpu, 1);
-    if (cpu[2] & (1 << 31)) return TRUE;  // Hypervisor present bit
+    if (cpu[2] & (1 << 31)) return TRUE;
     
-    // RDTSC timing check with multiple samples
     unsigned __int64 t1, t2, total = 0;
     for (int sample = 0; sample < 3; sample++) {
         _mm_lfence(); 
@@ -104,7 +103,7 @@ static BOOL IsVM() {
         _mm_lfence();
         total += (t2 - t1);
     }
-    return (total / 3) < 0x50000;  // Too fast = likely VM
+    return (total / 3) < 0x50000;
 }
 
 // Verify PE header integrity
@@ -116,7 +115,6 @@ static BOOL VerifyPEHeader(HMODULE hMod) {
 }
 
 extern "C" void __cdecl StubEntry() {
-    // Stack-allocated strings to avoid .rdata
     char s_k32[13] = {'k','e','r','n','e','l','3','2','.','d','l','l',0};
     char s_exit[12] = {'E','x','i','t','P','r','o','c','e','s','s',0};
     char s_vp[15] = {'V','i','r','t','u','a','l','P','r','o','t','e','c','t',0};
@@ -125,26 +123,23 @@ extern "C" void __cdecl StubEntry() {
     auto fnExit = hKernel ? (void(WINAPI*)(UINT))GetProc(hKernel, s_exit) : NULL;
     auto fnVP   = hKernel ? (BOOL(WINAPI*)(LPVOID, SIZE_T, DWORD, PDWORD))GetProc(hKernel, s_vp) : NULL;
 
-    // Anti-VM check
     if (IsVM()) { 
         if(fnExit) fnExit(0xDEAD); 
         return; 
     }
 
-    // Get our own image base from PEB
 #ifdef _M_X64
     PBYTE peb = (PBYTE)__readgsqword(0x60);
-    HMODULE hMod = *(HMODULE*)(peb + 0x10);
+    HMODULE hMod = *(HMODULE*)((PBYTE)peb + 0x10);
 #else
     PBYTE peb = (PBYTE)__readfsdword(0x30);
-    HMODULE hMod = *(HMODULE*)(peb + 0x08);
+    HMODULE hMod = *(HMODULE*)((PBYTE)peb + 0x08);
 #endif
     if (!hMod) { 
         if(fnExit) fnExit(0xBAD0); 
         return; 
     }
 
-    // Verify PE integrity
     if (!VerifyPEHeader(hMod)) {
         if(fnExit) fnExit(0xBAD0);
         return;
@@ -154,7 +149,6 @@ extern "C" void __cdecl StubEntry() {
     PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
     uintptr_t protRVA = 0;
     
-    // Find .prot section
     for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++) {
         if (sec[i].Name[0] == '.' && sec[i].Name[1] == 'p' && 
             sec[i].Name[2] == 'r' && sec[i].Name[3] == 'o' && 
@@ -168,14 +162,12 @@ extern "C" void __cdecl StubEntry() {
         return; 
     }
 
-    // Read metadata
     ProtectorMeta* meta = (ProtectorMeta*)((uintptr_t)hMod + protRVA + META_OFFSET);
     if (!meta->OriginalOEP || meta->OriginalOEP == (uintptr_t)-1) {
         if(fnExit) fnExit(0xBAD2); 
         return;
     }
 
-    // Decrypt payload
     BYTE* payload = (BYTE*)((uintptr_t)hMod + meta->PayloadRVA);
     DWORD old;
     for (uintptr_t off = 0; off < meta->PayloadSize; off += 0x1000) {
@@ -183,18 +175,14 @@ extern "C" void __cdecl StubEntry() {
         BYTE* p = payload + off;
         DWORD tmp;
         
-        // Temporarily set to READWRITE for decryption
         if (fnVP) fnVP(p, sz, PAGE_READWRITE, &tmp);
         
-        // XOR decrypt
         for (uintptr_t i = 0; i < sz; i++) 
             p[i] ^= (BYTE)((meta->XorKey >> ((i % 4) * 8)) & 0xFF);
         
-        // Restore to EXECUTE_READ
         if (fnVP) fnVP(p, sz, PAGE_EXECUTE_READ, &old);
     }
 
-    // Jump to original entry point
     typedef int(__cdecl* OEP_t)();
     OEP_t Target = (OEP_t)((uintptr_t)hMod + meta->OriginalOEP);
     int ret = Target();
